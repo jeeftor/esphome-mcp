@@ -23,12 +23,61 @@ It talks to two ESPHome transports:
 | `esphome_compile`        | Dashboard  | Compile firmware (summarized output)                  |
 | `esphome_install`        | Dashboard  | Compile + OTA install                                 |
 | `esphome_get_logs`       | Dashboard  | Fetch the last N log lines                            |
-| `esphome_list_entities`  | Native API | List entities + current states (requires API PSK)     |
+| `esphome_list_entities`  | Native API | List entities + current states (auto-discovers PSK)  |
+
+`esphome_list_entities` can auto-discover the device's host and encryption PSK
+from the dashboard — just pass `device` instead of `host`/`psk`. The host is
+fetched from `/devices` and the PSK from `/json-config` (which resolves
+`!secret` references).
 
 ## Install
 
+### From source
+
 ```bash
 make install   # installs `esphome-mcp` to $GOBIN
+```
+
+### Docker
+
+```bash
+docker pull ghcr.io/jeeftor/esphome-mcp:latest
+docker run --rm -p 3333:3333 \
+  -e ESPHOME_URL=http://homeassistant.local:6052 \
+  ghcr.io/jeeftor/esphome-mcp:latest
+```
+
+The MCP endpoint is at `http://localhost:3333/mcp` (Streamable HTTP transport).
+
+### Docker Compose
+
+```bash
+# Edit compose.yaml to set your ESPHOME_URL, then:
+docker compose up -d
+```
+
+## Run
+
+### Stdio mode (default — for Claude Code, etc.)
+
+```bash
+esphome-mcp
+```
+
+Reads config from `~/.config/esphome-mcp/config.yaml` or `ESPHOME_*` env vars.
+
+### HTTP serve mode (for Docker / remote MCP clients)
+
+```bash
+esphome-mcp serve --http-addr 0.0.0.0:3333
+```
+
+Exposes the MCP Streamable HTTP endpoint at `/mcp`.
+
+### Version
+
+```bash
+esphome-mcp version
 ```
 
 ## Configure
@@ -77,6 +126,8 @@ Map port 6052 in the addon config and set `ESPHOME_HA_ADDON=true`. This sends
 
 ## Use with Claude Code / MCP
 
+### Stdio (local)
+
 **Standalone ESPHome:**
 
 ```json
@@ -113,12 +164,71 @@ Note: with auto-discovery, you no longer need to set `ESPHOME_PSK` —
 `esphome_list_entities` will fetch it from the dashboard via `/json-config`
 when you pass the `device` parameter.
 
+### HTTP (Docker / remote)
+
+If you run `esphome-mcp serve` in a container or on a remote host, point your
+MCP client at the HTTP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "esphome": {
+      "url": "http://localhost:3333/mcp"
+    }
+  }
+}
+```
+
+## Docker
+
+Tagged releases publish multi-architecture images (`linux/amd64`,
+`linux/arm64`) to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/jeeftor/esphome-mcp:latest
+docker run --rm -p 3333:3333 \
+  -e ESPHOME_URL=http://homeassistant.local:6052 \
+  -e ESPHOME_HA_ADDON=true \
+  ghcr.io/jeeftor/esphome-mcp:latest
+```
+
+The image is built from a static Go binary into a minimal `scratch` runtime
+(~15 MB). It includes CA certificates for outbound HTTPS to the ESPHome
+dashboard. It runs as non-root user 65532.
+
+Build locally:
+
+```bash
+make docker
+docker run --rm -p 3333:3333 \
+  -e ESPHOME_URL=http://host.docker.internal:6052 \
+  esphome-mcp:local
+```
+
+Or with Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+## Releases
+
+GitHub Actions runs GoReleaser for tags matching `v*`. This builds binaries
+for Linux/macOS/Windows (amd64/arm64) and publishes Docker images to GHCR.
+
+```bash
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+```
+
 ## Develop
 
 ```bash
 make build     # build the binary
+make serve     # run as HTTP server on :3333
 make test      # run tests (includes a full Noise handshake round-trip)
 make lint      # go vet
+make help      # list all targets
 ```
 
 ## Notes
@@ -126,8 +236,10 @@ make lint      # go vet
 - The native API client implements the `Noise_NNpsk0_25519_ChaChaPoly_SHA256`
   handshake required by modern ESPHome firmware. Plaintext (unencrypted) native
   connections are no longer supported by ESPHome as of 2026.1.
-- Dashboard auth supports three modes: Basic auth (standalone ESPHome with
-  password), HA addon ingress bypass (`X-HA-Ingress` header), and cookie-based
-  HA Supervisor login. See [Auth modes](#auth-modes) above.
+- Dashboard auth supports: Basic auth (standalone ESPHome with password), HA
+  addon ingress bypass (`X-HA-Ingress` header), or no auth (addon with
+  `DISABLE_HA_AUTHENTICATION`). See [Auth modes](#auth-modes) above.
 - `esphome_compile` / `esphome_install` return a summarized build log (errors
   + last N lines) to keep token usage low.
+- The HTTP serve mode uses the MCP Streamable HTTP transport, which supports
+  session management and is compatible with MCP clients that accept HTTP URLs.

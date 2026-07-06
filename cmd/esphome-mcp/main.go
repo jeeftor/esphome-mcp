@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -19,19 +20,43 @@ import (
 )
 
 var (
-	cfgFile string
-	version = "dev"
+	cfgFile   string
+	httpAddr  string
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
 )
 
 func main() {
 	root := &cobra.Command{
-		Use:     "esphome-mcp",
-		Short:   "ESPHome MCP server",
-		Long:    "esphome-mcp exposes ESPHome dashboard and native API operations as MCP tools over stdio.",
+		Use:   "esphome-mcp",
+		Short: "ESPHome MCP server",
+		Long: "esphome-mcp exposes ESPHome dashboard and native API operations as MCP tools.\n\n" +
+			"By default it runs over stdio for use with MCP clients like Claude Code.\n" +
+			"Use 'esphome-mcp serve' to run as an HTTP server for remote/Docker deployments.",
 		Version: version,
-		RunE:    run,
+		RunE:    runStdio,
 	}
 	root.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ~/.config/esphome-mcp/config.yaml)")
+
+	// serve subcommand — Streamable HTTP transport for Docker/remote use.
+	serveCmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run as an HTTP MCP server (Streamable HTTP transport)",
+		RunE:  runServe,
+	}
+	serveCmd.Flags().StringVar(&httpAddr, "http-addr", "0.0.0.0:3333", "HTTP listen address")
+	root.AddCommand(serveCmd)
+
+	// version subcommand — print build metadata.
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print build version, commit, and date",
+		Run: func(*cobra.Command, []string) {
+			fmt.Printf("esphome-mcp %s (commit: %s, built: %s)\n", version, commit, buildDate)
+		},
+	}
+	root.AddCommand(versionCmd)
 
 	cobra.CheckErr(root.Execute())
 }
@@ -63,9 +88,8 @@ func loadConfig() error {
 	return nil
 }
 
-func run(cmd *cobra.Command, _ []string) error {
-	_ = loadConfig()
-
+// newDashboardClient creates a dashboard client from the current config.
+func newDashboardClient() *dashboard.Client {
 	dash := dashboard.New(
 		viper.GetString("url"),
 		viper.GetString("username"),
@@ -84,17 +108,44 @@ func run(cmd *cobra.Command, _ []string) error {
 	if viper.GetBool("ha_addon") || viper.GetBool("ingress") {
 		dash.Ingress = true
 	}
+	return dash
+}
 
+// newMCPServer builds the MCP server with all tools registered.
+func newMCPServer(dash *dashboard.Client) *server.MCPServer {
 	s := server.NewMCPServer(
 		"esphome-mcp",
 		version,
 		server.WithToolCapabilities(false),
 	)
-
 	registerTools(s, dash)
+	return s
+}
 
+// runStdio runs the MCP server over stdio (default mode for Claude Code etc).
+func runStdio(_ *cobra.Command, _ []string) error {
+	_ = loadConfig()
+	dash := newDashboardClient()
+	s := newMCPServer(dash)
 	if err := server.ServeStdio(s); err != nil {
 		return fmt.Errorf("mcp server: %w", err)
+	}
+	return nil
+}
+
+// runServe runs the MCP server as a Streamable HTTP server for Docker/remote
+// deployments. The MCP endpoint is available at /mcp.
+func runServe(cmd *cobra.Command, _ []string) error {
+	_ = loadConfig()
+	dash := newDashboardClient()
+	s := newMCPServer(dash)
+
+	addr, _ := cmd.Flags().GetString("http-addr")
+	fmt.Fprintf(os.Stderr, "esphome-mcp %s listening on http://%s/mcp\n", version, addr)
+
+	httpServer := server.NewStreamableHTTPServer(s, server.WithEndpointPath("/mcp"))
+	if err := httpServer.Start(addr); err != nil {
+		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
 }

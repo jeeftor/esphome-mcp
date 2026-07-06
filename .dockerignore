@@ -1,0 +1,6 @@
+.git/
+.esphome-mcp
+*.test
+*.out
+.DS_Store
+coverage.txt
