@@ -1,0 +1,21 @@
+# ESPHome MCP server configuration.
+# Copy to ~/.config/esphome-mcp/config.yaml or pass --config <path>.
+# Any value below can also be set via environment variables prefixed with
+# ESPHOME_ (e.g. ESPHOME_URL, ESPHOME_PASSWORD, ESPHOME_PSK).
+
+# ESPHome dashboard URL (the web UI on port 6052).
+url: http://homeassistant.local:6052
+
+# Dashboard basic-auth credentials. Leave username empty if your dashboard
+# only uses a password. Omit entirely if no auth is configured.
+username: ""
+password: ""
+
+# Default API encryption PSK (base64) used by esphome_list_entities when the
+# tool call does not supply one. This is the `api.encryption.key` value from
+# the device's YAML.
+psk: ""
+
+# Optional: verify the device's reported name matches this during native API
+# connections.
+expected_name: ""

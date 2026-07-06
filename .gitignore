@@ -1,0 +1,6 @@
+/esphome-mcp
+/dist/
+*.test
+*.out
+.DS_Store
+coverage.txt
