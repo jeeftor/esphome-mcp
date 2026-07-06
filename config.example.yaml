@@ -15,21 +15,20 @@ password: ""
 
 # Mode 2: Home Assistant ESPHome addon.
 # The HA addon uses HA Supervisor auth by default, which does NOT support
-# Basic auth. Choose one of the following:
+# Basic auth. The /login endpoint requires SUPERVISOR_TOKEN (only available
+# inside the addon container), so external clients cannot use cookie-based
+# login. Instead, use one of these approaches:
 #
-# 2a. Ingress bypass (simplest — requires port 6052 mapped in addon config):
+# 2a. Disable addon auth (simplest):
+#   In the ESPHome addon config, set "Disable external authentication"
+#   (leave_front_door_open / DISABLE_HA_AUTHENTICATION) and map port 6052.
+#   Then no credentials are needed — just set the URL and go.
+#
+# 2b. Ingress bypass (port 6052 mapped, auth still enabled):
 #   ha_addon: true   # or ESPHOME_HA_ADDON=true
-# Sends X-HA-Ingress: YES on all requests. Works when port 6052 is directly
-# reachable. If you've disabled HA auth on the addon (DISABLE_HA_AUTHENTICATION),
-# you don't even need this — just leave everything blank.
-#
-# 2b. Cookie-based login (for HA Supervisor auth without ingress):
-#   ha_login: true   # or ESPHOME_HA_LOGIN=true
-#   username: "your-ha-username"
-#   password: "your-ha-password"
-# POSTs credentials to /login and captures the session cookie.
+# Sends X-HA-Ingress: YES on all requests, which the addon treats as
+# authenticated (the same way HA's ingress proxy does).
 ha_addon: false
-ha_login: false
 
 # --- Native API (entity states) ---
 

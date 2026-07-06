@@ -100,6 +100,10 @@ func (c *Client) authHeader() string {
 // X-HA-Ingress header is sent (bypasses HA addon auth for direct port 6052
 // access). Otherwise Basic auth is used if a password is configured. The
 // cookie jar handles session cookies from Login() automatically.
+//
+// For POST requests in standalone-with-password mode, the XSRF token from the
+// cookie jar is added as the X-XSRF-TOKEN header (Tornado requires this when
+// xsrf_cookies is enabled).
 func (c *Client) applyAuth(req *http.Request) {
 	if c.Ingress {
 		req.Header.Set("X-HA-Ingress", "YES")
@@ -107,6 +111,53 @@ func (c *Client) applyAuth(req *http.Request) {
 	if h := c.authHeader(); h != "" {
 		req.Header.Set("Authorization", h)
 	}
+	// XSRF protection is enabled when the standalone dashboard has a password
+	// set (Tornado sets xsrf_cookies: settings.using_password). POST requests
+	// must include the XSRF token from the cookie. We fetch it from the cookie
+	// jar for the request's host.
+	if req.Method == http.MethodPost && c.Password != "" && !c.Ingress {
+		if xsrf := c.xsrfToken(req.URL); xsrf != "" {
+			req.Header.Set("X-XSRF-TOKEN", xsrf)
+		}
+	}
+}
+
+// xsrfToken extracts the _xsrf cookie value for the given URL from the cookie
+// jar. Returns "" if no XSRF cookie is present (e.g., the dashboard doesn't
+// use XSRF, or we haven't fetched a page yet).
+func (c *Client) xsrfToken(u *url.URL) string {
+	if c.HTTP.Jar == nil {
+		return ""
+	}
+	for _, cookie := range c.HTTP.Jar.Cookies(u) {
+		if cookie.Name == "_xsrf" {
+			return cookie.Value
+		}
+	}
+	return ""
+}
+
+// ensureXSRFCookie fetches the dashboard root page to prime the XSRF cookie
+// in the cookie jar. This is needed before POST requests when the standalone
+// dashboard has a password set (Tornado sets the _xsrf cookie on page load).
+// Called automatically by SaveConfig if no XSRF cookie is present yet.
+func (c *Client) ensureXSRFCookie(ctx context.Context) error {
+	if c.Password == "" || c.Ingress {
+		return nil // XSRF only applies to standalone-with-password
+	}
+	if c.xsrfToken(&url.URL{Scheme: "http", Host: "placeholder"}) != "" {
+		return nil // already have the cookie
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
 
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
@@ -118,14 +169,17 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	return req, nil
 }
 
-// Login authenticates against the HA addon's /login endpoint using HA
-// Supervisor auth. The resulting session cookie is stored in the client's
-// cookie jar and sent automatically on subsequent requests. This is needed
-// when the ESPHome addon uses HA addon auth (the default) and the ingress
-// header bypass is not desired.
+// Login authenticates against the standalone ESPHome dashboard's /login
+// endpoint (native password auth). The resulting session cookie is stored in
+// the client's cookie jar and sent automatically on subsequent requests.
 //
-// For standalone ESPHome with a password set, Login is unnecessary — Basic
-// auth is used automatically.
+// This is NOT needed when using Basic auth (password is set and not in HA
+// addon mode) — Basic auth is sent on every request automatically.
+//
+// This does NOT work for HA addon auth: the HA addon's /login calls
+// http://supervisor/auth with SUPERVISOR_TOKEN, which is only available
+// inside the addon container. External clients must use the ingress header
+// bypass instead (set Client.Ingress = true).
 func (c *Client) Login(ctx context.Context) error {
 	form := url.Values{}
 	form.Set("username", c.Username)
@@ -135,6 +189,7 @@ func (c *Client) Login(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.applyAuth(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return fmt.Errorf("login: %w", err)
@@ -217,6 +272,11 @@ func (c *Client) GetConfig(ctx context.Context, configuration string) (string, e
 // SaveConfig writes the YAML configuration for the named device.
 func (c *Client) SaveConfig(ctx context.Context, configuration, yaml string) error {
 	configuration = ensureYAMLExt(configuration)
+	// Prime the XSRF cookie for standalone-with-password mode (Tornado
+	// requires the _xsrf token on POST requests when xsrf_cookies is enabled).
+	if err := c.ensureXSRFCookie(ctx); err != nil {
+		return fmt.Errorf("prime xsrf cookie: %w", err)
+	}
 	req, err := c.newRequest(ctx, http.MethodPost, "/edit?configuration="+url.QueryEscape(configuration), bytes.NewReader([]byte(yaml)))
 	if err != nil {
 		return err
@@ -252,6 +312,56 @@ func (c *Client) GetInfo(ctx context.Context, configuration string) (json.RawMes
 		return nil, fmt.Errorf("get info: %s", resp.Status)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// GetJSONConfig returns the fully parsed YAML configuration as JSON, with
+// secrets resolved (runs `esphome config --show-secrets` on the server side).
+// This is the endpoint to use for extracting the API encryption key
+// (api.encryption.key) needed by the native API client.
+func (c *Client) GetJSONConfig(ctx context.Context, configuration string) (json.RawMessage, error) {
+	configuration = ensureYAMLExt(configuration)
+	req, err := c.newRequest(ctx, http.MethodGet, "/json-config?configuration="+url.QueryEscape(configuration), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("configuration %q not found", configuration)
+	}
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("config validation failed: %s", strings.TrimSpace(string(body)))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get json-config: %s", resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// GetEncryptionKey extracts the API encryption PSK (base64) from a device's
+// parsed configuration. It calls /json-config and navigates to
+// api.encryption.key. Returns ("", nil) if the device has no encryption
+// configured.
+func (c *Client) GetEncryptionKey(ctx context.Context, configuration string) (string, error) {
+	raw, err := c.GetJSONConfig(ctx, configuration)
+	if err != nil {
+		return "", err
+	}
+	var cfg struct {
+		API struct {
+			Encryption struct {
+				Key string `json:"key"`
+			} `json:"encryption"`
+		} `json:"api"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return "", fmt.Errorf("parse json-config: %w", err)
+	}
+	return cfg.API.Encryption.Key, nil
 }
 
 // ensureYAMLExt makes sure a configuration name ends with .yaml or .yml.

@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -45,7 +44,6 @@ func init() {
 	viper.SetDefault("password", "")
 	viper.SetDefault("username", "")
 	viper.SetDefault("ha_addon", false)
-	viper.SetDefault("ha_login", false)
 	viper.SetDefault("ingress", false)
 	viper.SetDefault("psk", "")
 	viper.SetDefault("expected_name", "")
@@ -73,20 +71,18 @@ func run(cmd *cobra.Command, _ []string) error {
 		viper.GetString("username"),
 		viper.GetString("password"),
 	)
-	// HA addon: either use the ingress header bypass (when port 6052 is
-	// mapped) or perform a cookie-based login against HA Supervisor auth.
-	haAddon := viper.GetBool("ha_addon")
-	ingress := viper.GetBool("ingress")
-	if haAddon || ingress {
+	// HA addon auth: the addon uses HA Supervisor auth by default, which
+	// does NOT support Basic auth. The X-HA-Ingress header bypasses auth
+	// for direct port 6052 access (requires port mapping in addon config).
+	// If the user sets DISABLE_HA_AUTHENTICATION on the addon, no auth is
+	// needed at all.
+	//
+	// Note: cookie-based login via /login does NOT work for external clients
+	// because it requires SUPERVISOR_TOKEN (only available inside the addon
+	// container). The ingress header is the only viable auth path for an
+	// external MCP server talking to a HA addon with auth enabled.
+	if viper.GetBool("ha_addon") || viper.GetBool("ingress") {
 		dash.Ingress = true
-	} else if viper.GetString("password") != "" && viper.GetBool("ha_login") {
-		// HA addon with Supervisor auth: login to get a session cookie.
-		// This is the fallback when ingress is not available.
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if err := dash.Login(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: HA addon login failed: %v\n", err)
-		}
-		cancel()
 	}
 
 	s := server.NewMCPServer(
@@ -179,10 +175,11 @@ func esphomeGetLogsTool() mcp.Tool {
 
 func esphomeListEntitiesTool() mcp.Tool {
 	return mcp.NewTool("esphome_list_entities",
-		mcp.WithDescription("List entities and their current states for a device via the ESPHome native API (port 6053). Requires the device's API encryption PSK."),
-		mcp.WithString("host", mcp.Required(), mcp.Description("Device hostname or IP address for the native API connection.")),
+		mcp.WithDescription("List entities and their current states for a device via the ESPHome native API (port 6053, Noise-encrypted). The device's host and encryption PSK are auto-discovered from the dashboard when possible; provide them explicitly to override."),
+		mcp.WithString("device", mcp.Description("Device name or configuration filename. If provided, host and PSK are auto-discovered from the dashboard.")),
+		mcp.WithString("host", mcp.Description("Device hostname or IP address. Required if 'device' is not provided or auto-discovery fails.")),
 		mcp.WithNumber("port", mcp.Description("Native API port (default 6053).")),
-		mcp.WithString("psk", mcp.Description("Base64-encoded API encryption key (api.encryption.key). Falls back to the ESPHOME_PSK env var / config.")),
+		mcp.WithString("psk", mcp.Description("Base64-encoded API encryption key (api.encryption.key). Falls back to the ESPHOME_PSK env var / config, or auto-discovery from the dashboard via /json-config.")),
 	)
 }
 
@@ -314,12 +311,39 @@ func (e *toolEnv) handleGetLogs(ctx context.Context, req mcp.CallToolRequest) (*
 }
 
 func (e *toolEnv) handleListEntities(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	host, err := req.RequireString("host")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
+	host := req.GetString("host", "")
 	port := int(req.GetFloat("port", 6053))
 	psk := req.GetString("psk", viper.GetString("psk"))
+	device := req.GetString("device", "")
+
+	// Auto-discover host and PSK from the dashboard when a device name is
+	// provided and the corresponding parameter wasn't explicitly set.
+	if device != "" {
+		cfgName := device
+		if host == "" {
+			if h, err := e.lookupDeviceAddress(ctx, cfgName); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("auto-discover host: %v (provide 'host' explicitly)", err)), nil
+			} else {
+				host = h
+			}
+		}
+		if psk == "" {
+			if key, err := e.dash.GetEncryptionKey(ctx, cfgName); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("auto-discover PSK: %v (provide 'psk' explicitly)", err)), nil
+			} else if key == "" {
+				return mcp.NewToolResultError("device has no api.encryption.key configured; encryption is required for the native API"), nil
+			} else {
+				psk = key
+			}
+		}
+	}
+
+	if host == "" {
+		return mcp.NewToolResultError("host is required (provide 'host' or 'device' for auto-discovery)"), nil
+	}
+	if psk == "" {
+		return mcp.NewToolResultError("psk is required (provide 'psk', set ESPHOME_PSK, or provide 'device' for auto-discovery)"), nil
+	}
 
 	nc := &native.Client{Host: host, Port: port, PSK: psk, ExpectedName: viper.GetString("expected_name")}
 	res, err := nc.ListEntities(ctx, 3*time.Second)
@@ -353,6 +377,28 @@ func (e *toolEnv) handleListEntities(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	return mcp.NewToolResultText(string(out)), nil
+}
+
+// lookupDeviceAddress finds a device's IP address from the dashboard /devices
+// response by matching the device name or configuration filename.
+func (e *toolEnv) lookupDeviceAddress(ctx context.Context, device string) (string, error) {
+	devices, err := e.dash.ListDevices(ctx)
+	if err != nil {
+		return "", err
+	}
+	target := device
+	if !strings.HasSuffix(target, ".yaml") && !strings.HasSuffix(target, ".yml") {
+		target += ".yaml"
+	}
+	for _, d := range devices.Configured {
+		if d.Configuration == target || d.Name == device {
+			if d.Address == nil || *d.Address == "" {
+				return "", fmt.Errorf("device %q has no known address (may be offline or using host platform)", device)
+			}
+			return *d.Address, nil
+		}
+	}
+	return "", fmt.Errorf("device %q not found in dashboard", device)
 }
 
 // summarize trims long command output to errors + the last N lines, prefixed

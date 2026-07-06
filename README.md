@@ -42,39 +42,38 @@ Config is read from `~/.config/esphome-mcp/config.yaml` (see
 | `ESPHOME_USERNAME`  | `username`     | `""`                          |
 | `ESPHOME_PASSWORD`  | `password`     | `""`                          |
 | `ESPHOME_HA_ADDON`  | `ha_addon`     | `false`                       |
-| `ESPHOME_HA_LOGIN`  | `ha_login`     | `false`                       |
 | `ESPHOME_PSK`       | `psk`          | `""` (native API encryption)  |
 
-`esphome_list_entities` takes `host`, `port`, and `psk` per call; the `psk`
-falls back to `ESPHOME_PSK` / the `psk` config key. The PSK is the
-base64-encoded `api.encryption.key` from the device's YAML.
+`esphome_list_entities` can auto-discover the device's host and encryption PSK
+from the dashboard — just pass `device` instead of `host`/`psk`. The PSK is
+fetched from `/json-config` (which resolves `!secret` references). You can
+also set `ESPHOME_PSK` as a fallback or provide `psk` per call.
 
 ## Auth modes
 
 ### Standalone ESPHome (password)
 
 Set `ESPHOME_PASSWORD` (and `ESPHOME_USERNAME` if your dashboard requires it).
-Basic auth is sent on all HTTP and WebSocket requests.
+Basic auth is sent on all HTTP and WebSocket requests. XSRF tokens are handled
+automatically for POST requests (e.g. `esphome_save_config`).
 
 ### Home Assistant ESPHome addon
 
 The HA addon uses **HA Supervisor auth** by default, which does **not** support
-Basic auth. You have three options:
+Basic auth. The `/login` endpoint requires `SUPERVISOR_TOKEN` (only available
+inside the addon container), so external clients **cannot** use cookie-based
+login. You have two options:
 
 **Option A — Disable addon auth (simplest):**
 In the ESPHome addon config, set "Disable external authentication"
-(`DISABLE_HA_AUTHENTICATION=true`) and map port 6052. Then no credentials are
-needed — just set `ESPHOME_URL` and go.
+(`DISABLE_HA_AUTHENTICATION=true`, aka `leave_front_door_open`) and map port
+6052 in the addon's Network section. Then no credentials are needed — just set
+`ESPHOME_URL` and go.
 
-**Option B — Ingress bypass (port 6052 mapped):**
+**Option B — Ingress bypass (port 6052 mapped, auth still enabled):**
 Map port 6052 in the addon config and set `ESPHOME_HA_ADDON=true`. This sends
 `X-HA-Ingress: YES` on all requests, which the addon treats as authenticated
 (the same way HA's ingress proxy does).
-
-**Option C — Cookie-based login (HA Supervisor auth):**
-Set `ESPHOME_HA_LOGIN=true` with your HA username and password. The server
-POSTs to `/login` at startup and captures the session cookie for all
-subsequent requests.
 
 ## Use with Claude Code / MCP
 
@@ -87,8 +86,7 @@ subsequent requests.
       "command": "esphome-mcp",
       "env": {
         "ESPHOME_URL": "http://homeassistant.local:6052",
-        "ESPHOME_PASSWORD": "your-dashboard-password",
-        "ESPHOME_PSK": "base64-api-encryption-key"
+        "ESPHOME_PASSWORD": "your-dashboard-password"
       }
     }
   }
@@ -104,32 +102,16 @@ subsequent requests.
       "command": "esphome-mcp",
       "env": {
         "ESPHOME_URL": "http://homeassistant.local:6052",
-        "ESPHOME_HA_ADDON": "true",
-        "ESPHOME_PSK": "base64-api-encryption-key"
+        "ESPHOME_HA_ADDON": "true"
       }
     }
   }
 }
 ```
 
-**Home Assistant ESPHome addon (cookie login):**
-
-```json
-{
-  "mcpServers": {
-    "esphome": {
-      "command": "esphome-mcp",
-      "env": {
-        "ESPHOME_URL": "http://homeassistant.local:6052",
-        "ESPHOME_HA_LOGIN": "true",
-        "ESPHOME_USERNAME": "your-ha-user",
-        "ESPHOME_PASSWORD": "your-ha-password",
-        "ESPHOME_PSK": "base64-api-encryption-key"
-      }
-    }
-  }
-}
-```
+Note: with auto-discovery, you no longer need to set `ESPHOME_PSK` —
+`esphome_list_entities` will fetch it from the dashboard via `/json-config`
+when you pass the `device` parameter.
 
 ## Develop
 
