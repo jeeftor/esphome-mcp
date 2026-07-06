@@ -36,20 +36,49 @@ make install   # installs `esphome-mcp` to $GOBIN
 Config is read from `~/.config/esphome-mcp/config.yaml` (see
 `config.example.yaml`) or environment variables prefixed with `ESPHOME_`:
 
-| Env var           | Config key     | Default                       |
-| ----------------- | -------------- | ----------------------------- |
-| `ESPHOME_URL`     | `url`          | `http://localhost:6052`       |
-| `ESPHOME_USERNAME`| `username`     | `""`                          |
-| `ESPHOME_PASSWORD`| `password`     | `""`                          |
-| `ESPHOME_PSK`     | `psk`          | `""` (native API encryption)  |
+| Env var             | Config key     | Default                       |
+| ------------------- | -------------- | ----------------------------- |
+| `ESPHOME_URL`       | `url`          | `http://localhost:6052`       |
+| `ESPHOME_USERNAME`  | `username`     | `""`                          |
+| `ESPHOME_PASSWORD`  | `password`     | `""`                          |
+| `ESPHOME_HA_ADDON`  | `ha_addon`     | `false`                       |
+| `ESPHOME_HA_LOGIN`  | `ha_login`     | `false`                       |
+| `ESPHOME_PSK`       | `psk`          | `""` (native API encryption)  |
 
 `esphome_list_entities` takes `host`, `port`, and `psk` per call; the `psk`
 falls back to `ESPHOME_PSK` / the `psk` config key. The PSK is the
 base64-encoded `api.encryption.key` from the device's YAML.
 
+## Auth modes
+
+### Standalone ESPHome (password)
+
+Set `ESPHOME_PASSWORD` (and `ESPHOME_USERNAME` if your dashboard requires it).
+Basic auth is sent on all HTTP and WebSocket requests.
+
+### Home Assistant ESPHome addon
+
+The HA addon uses **HA Supervisor auth** by default, which does **not** support
+Basic auth. You have three options:
+
+**Option A — Disable addon auth (simplest):**
+In the ESPHome addon config, set "Disable external authentication"
+(`DISABLE_HA_AUTHENTICATION=true`) and map port 6052. Then no credentials are
+needed — just set `ESPHOME_URL` and go.
+
+**Option B — Ingress bypass (port 6052 mapped):**
+Map port 6052 in the addon config and set `ESPHOME_HA_ADDON=true`. This sends
+`X-HA-Ingress: YES` on all requests, which the addon treats as authenticated
+(the same way HA's ingress proxy does).
+
+**Option C — Cookie-based login (HA Supervisor auth):**
+Set `ESPHOME_HA_LOGIN=true` with your HA username and password. The server
+POSTs to `/login` at startup and captures the session cookie for all
+subsequent requests.
+
 ## Use with Claude Code / MCP
 
-Add to `.mcp.json`:
+**Standalone ESPHome:**
 
 ```json
 {
@@ -59,6 +88,42 @@ Add to `.mcp.json`:
       "env": {
         "ESPHOME_URL": "http://homeassistant.local:6052",
         "ESPHOME_PASSWORD": "your-dashboard-password",
+        "ESPHOME_PSK": "base64-api-encryption-key"
+      }
+    }
+  }
+}
+```
+
+**Home Assistant ESPHome addon (ingress bypass):**
+
+```json
+{
+  "mcpServers": {
+    "esphome": {
+      "command": "esphome-mcp",
+      "env": {
+        "ESPHOME_URL": "http://homeassistant.local:6052",
+        "ESPHOME_HA_ADDON": "true",
+        "ESPHOME_PSK": "base64-api-encryption-key"
+      }
+    }
+  }
+}
+```
+
+**Home Assistant ESPHome addon (cookie login):**
+
+```json
+{
+  "mcpServers": {
+    "esphome": {
+      "command": "esphome-mcp",
+      "env": {
+        "ESPHOME_URL": "http://homeassistant.local:6052",
+        "ESPHOME_HA_LOGIN": "true",
+        "ESPHOME_USERNAME": "your-ha-user",
+        "ESPHOME_PASSWORD": "your-ha-password",
         "ESPHOME_PSK": "base64-api-encryption-key"
       }
     }
@@ -79,7 +144,8 @@ make lint      # go vet
 - The native API client implements the `Noise_NNpsk0_25519_ChaChaPoly_SHA256`
   handshake required by modern ESPHome firmware. Plaintext (unencrypted) native
   connections are no longer supported by ESPHome as of 2026.1.
-- Dashboard auth uses HTTP Basic auth via the `Authorization` header, applied
-  to both HTTP requests and the WebSocket upgrade.
+- Dashboard auth supports three modes: Basic auth (standalone ESPHome with
+  password), HA addon ingress bypass (`X-HA-Ingress` header), and cookie-based
+  HA Supervisor login. See [Auth modes](#auth-modes) above.
 - `esphome_compile` / `esphome_install` return a summarized build log (errors
   + last N lines) to keep token usage low.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -43,6 +44,11 @@ func init() {
 	viper.SetDefault("url", "http://localhost:6052")
 	viper.SetDefault("password", "")
 	viper.SetDefault("username", "")
+	viper.SetDefault("ha_addon", false)
+	viper.SetDefault("ha_login", false)
+	viper.SetDefault("ingress", false)
+	viper.SetDefault("psk", "")
+	viper.SetDefault("expected_name", "")
 }
 
 func loadConfig() error {
@@ -67,6 +73,21 @@ func run(cmd *cobra.Command, _ []string) error {
 		viper.GetString("username"),
 		viper.GetString("password"),
 	)
+	// HA addon: either use the ingress header bypass (when port 6052 is
+	// mapped) or perform a cookie-based login against HA Supervisor auth.
+	haAddon := viper.GetBool("ha_addon")
+	ingress := viper.GetBool("ingress")
+	if haAddon || ingress {
+		dash.Ingress = true
+	} else if viper.GetString("password") != "" && viper.GetBool("ha_login") {
+		// HA addon with Supervisor auth: login to get a session cookie.
+		// This is the fallback when ingress is not available.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := dash.Login(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: HA addon login failed: %v\n", err)
+		}
+		cancel()
+	}
 
 	s := server.NewMCPServer(
 		"esphome-mcp",

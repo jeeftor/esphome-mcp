@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"time"
@@ -19,10 +20,18 @@ import (
 )
 
 // Client is an ESPHome dashboard API client.
+//
+// Auth modes (mutually exclusive):
+//   - Basic auth (standalone ESPHome with password set)
+//   - HA addon ingress (sends X-HA-Ingress: YES; works when port 6052 is
+//     mapped and the addon is reachable directly)
+//   - HA addon login (POSTs HA credentials to /login, captures the session
+//     cookie; works when HA Supervisor auth is enabled)
 type Client struct {
 	BaseURL  string
 	Username string
 	Password string
+	Ingress  bool // send X-HA-Ingress: YES (HA addon with mapped port)
 	HTTP     *http.Client
 	Dialer   *websocket.Dialer
 }
@@ -31,11 +40,12 @@ type Client struct {
 // "http://homeassistant.local:6052").
 func New(baseURL, username, password string) *Client {
 	baseURL = strings.TrimRight(baseURL, "/")
+	jar, _ := cookiejar.New(nil)
 	return &Client{
 		BaseURL:  baseURL,
 		Username: username,
 		Password: password,
-		HTTP:     &http.Client{Timeout: 120 * time.Second},
+		HTTP:     &http.Client{Timeout: 120 * time.Second, Jar: jar},
 		Dialer: &websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
 		},
@@ -74,9 +84,11 @@ type DeviceListResponse struct {
 	Importable []ImportableDevice `json:"importable"`
 }
 
-// authHeader returns the Basic auth header value, or "" if no password is set.
+// authHeader returns the Basic auth header value, or "" if no password is set
+// and ingress mode is not active. In HA addon mode, Basic auth is not used —
+// the ingress header or cookie-based login handles auth instead.
 func (c *Client) authHeader() string {
-	if c.Password == "" {
+	if c.Ingress || c.Password == "" {
 		return ""
 	}
 	user := c.Username
@@ -84,15 +96,55 @@ func (c *Client) authHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
 }
 
+// applyAuth sets auth headers on an HTTP request. When Ingress is true, the
+// X-HA-Ingress header is sent (bypasses HA addon auth for direct port 6052
+// access). Otherwise Basic auth is used if a password is configured. The
+// cookie jar handles session cookies from Login() automatically.
+func (c *Client) applyAuth(req *http.Request) {
+	if c.Ingress {
+		req.Header.Set("X-HA-Ingress", "YES")
+	}
+	if h := c.authHeader(); h != "" {
+		req.Header.Set("Authorization", h)
+	}
+}
+
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
 	if err != nil {
 		return nil, err
 	}
-	if h := c.authHeader(); h != "" {
-		req.Header.Set("Authorization", h)
-	}
+	c.applyAuth(req)
 	return req, nil
+}
+
+// Login authenticates against the HA addon's /login endpoint using HA
+// Supervisor auth. The resulting session cookie is stored in the client's
+// cookie jar and sent automatically on subsequent requests. This is needed
+// when the ESPHome addon uses HA addon auth (the default) and the ingress
+// header bypass is not desired.
+//
+// For standalone ESPHome with a password set, Login is unnecessary — Basic
+// auth is used automatically.
+func (c *Client) Login(ctx context.Context) error {
+	form := url.Values{}
+	form.Set("username", c.Username)
+	form.Set("password", c.Password)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/login", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("login failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // ListDevices returns all configured and importable devices from the dashboard.

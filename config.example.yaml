@@ -6,10 +6,32 @@
 # ESPHome dashboard URL (the web UI on port 6052).
 url: http://homeassistant.local:6052
 
-# Dashboard basic-auth credentials. Leave username empty if your dashboard
-# only uses a password. Omit entirely if no auth is configured.
+# --- Auth (choose one mode) ---
+
+# Mode 1: Standalone ESPHome with password (Basic auth).
+# Set username only if your dashboard requires it; most use password-only.
 username: ""
 password: ""
+
+# Mode 2: Home Assistant ESPHome addon.
+# The HA addon uses HA Supervisor auth by default, which does NOT support
+# Basic auth. Choose one of the following:
+#
+# 2a. Ingress bypass (simplest — requires port 6052 mapped in addon config):
+#   ha_addon: true   # or ESPHOME_HA_ADDON=true
+# Sends X-HA-Ingress: YES on all requests. Works when port 6052 is directly
+# reachable. If you've disabled HA auth on the addon (DISABLE_HA_AUTHENTICATION),
+# you don't even need this — just leave everything blank.
+#
+# 2b. Cookie-based login (for HA Supervisor auth without ingress):
+#   ha_login: true   # or ESPHOME_HA_LOGIN=true
+#   username: "your-ha-username"
+#   password: "your-ha-password"
+# POSTs credentials to /login and captures the session cookie.
+ha_addon: false
+ha_login: false
+
+# --- Native API (entity states) ---
 
 # Default API encryption PSK (base64) used by esphome_list_entities when the
 # tool call does not supply one. This is the `api.encryption.key` value from

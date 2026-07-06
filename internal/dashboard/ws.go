@@ -26,6 +26,9 @@ func (c *Client) wsCommand(ctx context.Context, path string, payload map[string]
 	wsURL += path
 
 	headers := http.Header{}
+	if c.Ingress {
+		headers.Set("X-HA-Ingress", "YES")
+	}
 	if h := c.authHeader(); h != "" {
 		headers.Set("Authorization", h)
 	}
