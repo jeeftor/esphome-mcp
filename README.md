@@ -213,10 +213,15 @@ docker compose up -d
 
 ## Releases
 
-GitHub Actions runs GoReleaser for tags matching `v*`. This builds binaries
-for Linux/macOS/Windows (amd64/arm64) and publishes Docker images to GHCR.
+GitHub Actions runs tests, `go vet`, and a GoReleaser config check before
+publishing any tag release. Tags matching `v*` build binaries for
+Linux/macOS/Windows (amd64/arm64), publish multi-arch Docker images to GHCR,
+and update the GitHub Release notes from `CHANGELOG.md`.
 
 ```bash
+make test
+make lint
+make release-check
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```

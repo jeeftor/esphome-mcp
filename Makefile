@@ -4,7 +4,7 @@ COMMIT   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE     ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS  := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(DATE)
 
-.PHONY: build run serve install test tidy lint clean docker docker-run help
+.PHONY: build run serve install test tidy lint release-check clean docker docker-run help
 
 help:
 	@printf 'Available targets:\n'
@@ -14,6 +14,7 @@ help:
 	@printf '  make install    Install the binary to $$GOBIN\n'
 	@printf '  make test       Run tests\n'
 	@printf '  make lint       Run go vet\n'
+	@printf '  make release-check Validate GoReleaser config\n'
 	@printf '  make docker     Build a local Docker image\n'
 	@printf '  make docker-run Run the local Docker image\n'
 	@printf '  make clean      Remove build artifacts\n'
@@ -38,6 +39,9 @@ tidy:
 
 lint:
 	go vet ./...
+
+release-check:
+	goreleaser check
 
 docker: build
 	docker build -t esphome-mcp:local .
