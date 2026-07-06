@@ -1,6 +1,6 @@
-// Package dashboard implements an HTTP/WebSocket client for the ESPHome
-// dashboard API (the server exposed on port 6052 by `esphome dashboard` and
-// the Home Assistant ESPHome addon).
+// Package dashboard implements a client for the ESPHome 2026.6+ Device Builder
+// API exposed on port 6052 by `esphome dashboard` and the Home Assistant
+// ESPHome add-on.
 package dashboard
 
 import (
@@ -11,41 +11,39 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"gopkg.in/yaml.v3"
 )
 
-// Client is an ESPHome dashboard API client.
-//
-// Auth modes (mutually exclusive):
-//   - Basic auth (standalone ESPHome with password set)
-//   - HA addon ingress (sends X-HA-Ingress: YES; works when port 6052 is
-//     mapped and the addon is reachable directly)
-//   - HA addon login (POSTs HA credentials to /login, captures the session
-//     cookie; works when HA Supervisor auth is enabled)
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
+// Client is an ESPHome Device Builder API client.
 type Client struct {
 	BaseURL  string
 	Username string
 	Password string
-	Ingress  bool // send X-HA-Ingress: YES (HA addon with mapped port)
+	Ingress  bool // send X-HA-Ingress: YES for HA add-on ingress-style auth.
 	HTTP     *http.Client
 	Dialer   *websocket.Dialer
+
+	mu        sync.Mutex
+	messageID int
 }
 
-// New returns a dashboard client targeting the given base URL (e.g.
-// "http://homeassistant.local:6052").
+// New returns a dashboard client targeting the given base URL.
 func New(baseURL, username, password string) *Client {
-	baseURL = strings.TrimRight(baseURL, "/")
-	jar, _ := cookiejar.New(nil)
 	return &Client{
-		BaseURL:  baseURL,
+		BaseURL:  strings.TrimRight(baseURL, "/"),
 		Username: username,
 		Password: password,
-		HTTP:     &http.Client{Timeout: 120 * time.Second, Jar: jar},
+		HTTP:     &http.Client{Timeout: 120 * time.Second},
 		Dialer: &websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
 		},
@@ -65,181 +63,220 @@ type ConfiguredDevice struct {
 	Address            *string  `json:"address"`
 	WebPort            *int     `json:"web_port"`
 	TargetPlatform     *string  `json:"target_platform"`
+	State              string   `json:"state"`
+	Status             string   `json:"status"`
 }
 
 // ImportableDevice is a discovered device that can be adopted.
 type ImportableDevice struct {
-	Name              string `json:"name"`
-	FriendlyName      string `json:"friendly_name"`
-	PackageImportURL  string `json:"package_import_url"`
-	ProjectName       string `json:"project_name"`
-	ProjectVersion    string `json:"project_version"`
-	Network           string `json:"network"`
-	Ignored           bool   `json:"ignored"`
+	Name             string `json:"name"`
+	FriendlyName     string `json:"friendly_name"`
+	PackageImportURL string `json:"package_import_url"`
+	ProjectName      string `json:"project_name"`
+	ProjectVersion   string `json:"project_version"`
+	Network          string `json:"network"`
+	Ignored          bool   `json:"ignored"`
 }
 
-// DeviceListResponse is the payload returned by GET /devices.
+// DeviceListResponse is the payload returned by devices/list.
 type DeviceListResponse struct {
 	Configured []ConfiguredDevice `json:"configured"`
 	Importable []ImportableDevice `json:"importable"`
 }
 
-// authHeader returns the Basic auth header value, or "" if no password is set
-// and ingress mode is not active. In HA addon mode, Basic auth is not used —
-// the ingress header or cookie-based login handles auth instead.
-func (c *Client) authHeader() string {
-	if c.Ingress || c.Password == "" {
-		return ""
-	}
-	user := c.Username
-	creds := user + ":" + c.Password
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+type serverInfo struct {
+	ServerVersion  string `json:"server_version"`
+	ESPHomeVersion string `json:"esphome_version"`
+	RequiresAuth   bool   `json:"requires_auth"`
 }
 
-// applyAuth sets auth headers on an HTTP request. When Ingress is true, the
-// X-HA-Ingress header is sent (bypasses HA addon auth for direct port 6052
-// access). Otherwise Basic auth is used if a password is configured. The
-// cookie jar handles session cookies from Login() automatically.
-//
-// For POST requests in standalone-with-password mode, the XSRF token from the
-// cookie jar is added as the X-XSRF-TOKEN header (Tornado requires this when
-// xsrf_cookies is enabled).
-func (c *Client) applyAuth(req *http.Request) {
+type wsRequest struct {
+	Command   string         `json:"command"`
+	MessageID int            `json:"message_id"`
+	Args      map[string]any `json:"args,omitempty"`
+}
+
+type wsResponse struct {
+	MessageID string          `json:"message_id"`
+	Result    json.RawMessage `json:"result"`
+	ErrorCode string          `json:"error_code"`
+	Details   string          `json:"details"`
+	Event     string          `json:"event"`
+	Data      json.RawMessage `json:"data"`
+}
+
+func (c *Client) nextMessageID() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.messageID++
+	return c.messageID
+}
+
+func (c *Client) wsURL() (string, error) {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported dashboard URL scheme %q", u.Scheme)
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/ws"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+func (c *Client) applyAuth(headers http.Header) {
 	if c.Ingress {
-		req.Header.Set("X-HA-Ingress", "YES")
+		headers.Set("X-HA-Ingress", "YES")
 	}
-	if h := c.authHeader(); h != "" {
-		req.Header.Set("Authorization", h)
-	}
-	// XSRF protection is enabled when the standalone dashboard has a password
-	// set (Tornado sets xsrf_cookies: settings.using_password). POST requests
-	// must include the XSRF token from the cookie. We fetch it from the cookie
-	// jar for the request's host.
-	if req.Method == http.MethodPost && c.Password != "" && !c.Ingress {
-		if xsrf := c.xsrfToken(req.URL); xsrf != "" {
-			req.Header.Set("X-XSRF-TOKEN", xsrf)
-		}
+	if c.Username != "" && c.Password != "" {
+		headers.Set("Authorization", "Basic "+basicAuth(c.Username, c.Password))
 	}
 }
 
-// xsrfToken extracts the _xsrf cookie value for the given URL from the cookie
-// jar. Returns "" if no XSRF cookie is present (e.g., the dashboard doesn't
-// use XSRF, or we haven't fetched a page yet).
-func (c *Client) xsrfToken(u *url.URL) string {
-	if c.HTTP.Jar == nil {
-		return ""
-	}
-	for _, cookie := range c.HTTP.Jar.Cookies(u) {
-		if cookie.Name == "_xsrf" {
-			return cookie.Value
-		}
-	}
-	return ""
+func basicAuth(username, password string) string {
+	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 }
 
-// ensureXSRFCookie fetches the dashboard root page to prime the XSRF cookie
-// in the cookie jar. This is needed before POST requests when the standalone
-// dashboard has a password set (Tornado sets the _xsrf cookie on page load).
-// Called automatically by SaveConfig if no XSRF cookie is present yet.
-func (c *Client) ensureXSRFCookie(ctx context.Context) error {
-	if c.Password == "" || c.Ingress {
-		return nil // XSRF only applies to standalone-with-password
-	}
-	if c.xsrfToken(&url.URL{Scheme: "http", Host: "placeholder"}) != "" {
-		return nil // already have the cookie
-	}
-	req, err := c.newRequest(ctx, http.MethodGet, "/", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	return nil
-}
-
-func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
+func (c *Client) connect(ctx context.Context) (*websocket.Conn, error) {
+	wsURL, err := c.wsURL()
 	if err != nil {
 		return nil, err
 	}
-	c.applyAuth(req)
-	return req, nil
+	headers := http.Header{}
+	c.applyAuth(headers)
+	conn, _, err := c.Dialer.DialContext(ctx, wsURL, headers)
+	if err != nil {
+		return nil, fmt.Errorf("websocket dial /ws: %w", err)
+	}
+
+	var info serverInfo
+	if err := conn.ReadJSON(&info); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read server_info: %w", err)
+	}
+	if info.RequiresAuth {
+		if c.Username == "" && c.Password == "" {
+			_ = conn.Close()
+			return nil, fmt.Errorf("dashboard requires authentication but no username/password were configured")
+		}
+		if _, err := c.sendOnConn(ctx, conn, "auth/login", map[string]any{
+			"username": c.Username,
+			"password": c.Password,
+		}, 30*time.Second); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("auth/login: %w", err)
+		}
+	}
+	return conn, nil
 }
 
-// Login authenticates against the standalone ESPHome dashboard's /login
-// endpoint (native password auth). The resulting session cookie is stored in
-// the client's cookie jar and sent automatically on subsequent requests.
-//
-// This is NOT needed when using Basic auth (password is set and not in HA
-// addon mode) — Basic auth is sent on every request automatically.
-//
-// This does NOT work for HA addon auth: the HA addon's /login calls
-// http://supervisor/auth with SUPERVISOR_TOKEN, which is only available
-// inside the addon container. External clients must use the ingress header
-// bypass instead (set Client.Ingress = true).
-func (c *Client) Login(ctx context.Context) error {
-	form := url.Values{}
-	form.Set("username", c.Username)
-	form.Set("password", c.Password)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/login", strings.NewReader(form.Encode()))
+func (c *Client) send(ctx context.Context, command string, args map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	conn, err := c.connect(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	c.applyAuth(req)
+	defer conn.Close()
+	return c.sendOnConn(ctx, conn, command, args, timeout)
+}
+
+func (c *Client) sendOnConn(ctx context.Context, conn *websocket.Conn, command string, args map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	id := c.nextMessageID()
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(deadline)
+		_ = conn.SetWriteDeadline(deadline)
+	} else {
+		deadline := time.Now().Add(timeout)
+		_ = conn.SetReadDeadline(deadline)
+		_ = conn.SetWriteDeadline(deadline)
+	}
+	if err := conn.WriteJSON(wsRequest{Command: command, MessageID: id, Args: args}); err != nil {
+		return nil, fmt.Errorf("send %s: %w", command, err)
+	}
+	for {
+		var resp wsResponse
+		if err := conn.ReadJSON(&resp); err != nil {
+			return nil, fmt.Errorf("read %s response: %w", command, err)
+		}
+		if resp.MessageID != strconv.Itoa(id) {
+			continue
+		}
+		if resp.ErrorCode != "" {
+			if resp.Details != "" {
+				return nil, fmt.Errorf("%s: %s", resp.ErrorCode, resp.Details)
+			}
+			return nil, fmt.Errorf("%s", resp.ErrorCode)
+		}
+		return resp.Result, nil
+	}
+}
+
+// Version returns the ESPHome dashboard version. This is the only REST endpoint
+// used by the client; all operational actions use /ws.
+func (c *Client) Version(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/version", nil)
+	if err != nil {
+		return "", err
+	}
+	headers := http.Header{}
+	c.applyAuth(headers)
+	req.Header = headers
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("login: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("login failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("version: %s", resp.Status)
 	}
-	return nil
+	var out struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("version: %w", err)
+	}
+	if out.Version == "" {
+		return "unknown", nil
+	}
+	return out.Version, nil
 }
 
-// ListDevices returns all configured and importable devices from the dashboard.
+// ListDevices returns all configured and importable devices from Device Builder.
 func (c *Client) ListDevices(ctx context.Context) (*DeviceListResponse, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, "/devices", nil)
+	raw, err := c.send(ctx, "devices/list", nil, 30*time.Second)
 	if err != nil {
 		return nil, err
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list devices: %s", resp.Status)
 	}
 	var out DeviceListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("list devices: %w", err)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("devices/list: %w", err)
 	}
 	return &out, nil
 }
 
-// Ping returns a map of configuration filename -> online (true/false).
+// Ping runs the Device Builder ping command and returns configured device states.
 func (c *Client) Ping(ctx context.Context) (map[string]bool, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, "/ping", nil)
+	if _, err := c.send(ctx, "ping", nil, 10*time.Second); err != nil {
+		return nil, err
+	}
+	devices, err := c.ListDevices(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ping: %s", resp.Status)
-	}
-	out := make(map[string]bool)
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("ping: %w", err)
+	out := make(map[string]bool, len(devices.Configured))
+	for _, d := range devices.Configured {
+		online := strings.EqualFold(d.State, "online") || strings.EqualFold(d.Status, "online")
+		out[d.Configuration] = online
 	}
 	return out, nil
 }
@@ -247,125 +284,313 @@ func (c *Client) Ping(ctx context.Context) (map[string]bool, error) {
 // GetConfig returns the raw YAML configuration for the named device.
 func (c *Client) GetConfig(ctx context.Context, configuration string) (string, error) {
 	configuration = ensureYAMLExt(configuration)
-	req, err := c.newRequest(ctx, http.MethodGet, "/edit?configuration="+url.QueryEscape(configuration), nil)
+	raw, err := c.send(ctx, "devices/get_config", map[string]any{"configuration": configuration}, 30*time.Second)
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return "", err
+	var out string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("devices/get_config: unexpected result: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("configuration %q not found", configuration)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("get config: %s", resp.Status)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	return out, nil
 }
 
 // SaveConfig writes the YAML configuration for the named device.
 func (c *Client) SaveConfig(ctx context.Context, configuration, yaml string) error {
 	configuration = ensureYAMLExt(configuration)
-	// Prime the XSRF cookie for standalone-with-password mode (Tornado
-	// requires the _xsrf token on POST requests when xsrf_cookies is enabled).
-	if err := c.ensureXSRFCookie(ctx); err != nil {
-		return fmt.Errorf("prime xsrf cookie: %w", err)
+	_, err := c.send(ctx, "devices/update_config", map[string]any{
+		"configuration": configuration,
+		"content":       yaml,
+	}, 30*time.Second)
+	return err
+}
+
+func formatValidation(raw json.RawMessage) (string, int, error) {
+	var result struct {
+		YAMLErrors []any `json:"yaml_errors"`
+		Errors     []any `json:"validation_errors"`
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/edit?configuration="+url.QueryEscape(configuration), bytes.NewReader([]byte(yaml)))
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", -1, fmt.Errorf("editor/validate_yaml: %w", err)
+	}
+	if len(result.YAMLErrors) == 0 && len(result.Errors) == 0 {
+		return "Configuration is valid.", 0, nil
+	}
+	var sb strings.Builder
+	for _, item := range result.YAMLErrors {
+		fmt.Fprintf(&sb, "YAML error: %s\n", validationMessage(item))
+	}
+	for _, item := range result.Errors {
+		fmt.Fprintf(&sb, "Validation error: %s\n", validationMessage(item))
+	}
+	return strings.TrimRight(sb.String(), "\n"), 1, nil
+}
+
+func validationMessage(item any) string {
+	if m, ok := item.(map[string]any); ok {
+		if msg, ok := m["message"].(string); ok {
+			return msg
+		}
+	}
+	return fmt.Sprint(item)
+}
+
+// Validate validates the saved device configuration.
+func (c *Client) Validate(ctx context.Context, configuration string) (string, int, error) {
+	configuration = ensureYAMLExt(configuration)
+	content, err := c.GetConfig(ctx, configuration)
 	if err != nil {
+		return "", -1, err
+	}
+	raw, err := c.send(ctx, "editor/validate_yaml", map[string]any{
+		"configuration": configuration,
+		"content":       content,
+	}, 60*time.Second)
+	if err != nil {
+		return "", -1, err
+	}
+	return formatValidation(raw)
+}
+
+func (c *Client) followJob(ctx context.Context, conn *websocket.Conn, jobID string, timeout time.Duration) (string, int, error) {
+	id := c.nextMessageID()
+	if timeout <= 0 {
+		timeout = 20 * time.Minute
+	}
+	deadline := time.Now().Add(timeout)
+	_ = conn.SetReadDeadline(deadline)
+	_ = conn.SetWriteDeadline(deadline)
+	if err := conn.WriteJSON(wsRequest{
+		Command:   "firmware/follow_job",
+		MessageID: id,
+		Args:      map[string]any{"job_id": jobID},
+	}); err != nil {
+		return "", -1, fmt.Errorf("send firmware/follow_job: %w", err)
+	}
+	var sb strings.Builder
+	code := -1
+	for {
+		var resp wsResponse
+		if err := conn.ReadJSON(&resp); err != nil {
+			return stripANSI(sb.String()), code, fmt.Errorf("read firmware/follow_job: %w", err)
+		}
+		if resp.MessageID != strconv.Itoa(id) {
+			continue
+		}
+		if resp.ErrorCode != "" {
+			return stripANSI(sb.String()), code, fmt.Errorf("%s: %s", resp.ErrorCode, resp.Details)
+		}
+		switch resp.Event {
+		case "output":
+			var line string
+			if err := json.Unmarshal(resp.Data, &line); err == nil {
+				sb.WriteString(line)
+			}
+		case "result":
+			var result struct {
+				ExitCode *int     `json:"exit_code"`
+				Output   []string `json:"output"`
+			}
+			_ = json.Unmarshal(resp.Data, &result)
+			if sb.Len() == 0 {
+				for _, line := range result.Output {
+					sb.WriteString(line)
+				}
+			}
+			if result.ExitCode != nil {
+				code = *result.ExitCode
+			}
+			return stripANSI(sb.String()), code, nil
+		}
+	}
+}
+
+func (c *Client) firmwareJob(ctx context.Context, command string, args map[string]any, timeout time.Duration) (string, int, error) {
+	conn, err := c.connect(ctx)
+	if err != nil {
+		return "", -1, err
+	}
+	defer conn.Close()
+	raw, err := c.sendOnConn(ctx, conn, command, args, 60*time.Second)
+	if err != nil {
+		return "", -1, err
+	}
+	var job struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(raw, &job); err != nil || job.JobID == "" {
+		return "", -1, fmt.Errorf("%s: no job_id in response", command)
+	}
+	return c.followJob(ctx, conn, job.JobID, timeout)
+}
+
+// Compile runs firmware compilation for the device and returns output + exit code.
+func (c *Client) Compile(ctx context.Context, configuration string) (string, int, error) {
+	return c.firmwareJob(ctx, "firmware/compile", map[string]any{
+		"configuration": ensureYAMLExt(configuration),
+	}, 20*time.Minute)
+}
+
+// Install compiles and uploads firmware to the device. OTA is the default port.
+func (c *Client) Install(ctx context.Context, configuration, port string) (string, int, error) {
+	if port == "" {
+		port = "OTA"
+	}
+	return c.firmwareJob(ctx, "firmware/install", map[string]any{
+		"configuration": ensureYAMLExt(configuration),
+		"port":          port,
+		"force_local":   false,
+	}, 30*time.Minute)
+}
+
+// Logs streams device logs for up to maxLines or timeout, then stops the stream.
+func (c *Client) Logs(ctx context.Context, configuration, port string, maxLines int, timeout time.Duration) (string, error) {
+	configuration = ensureYAMLExt(configuration)
+	if port == "" {
+		port = "OTA"
+	}
+	if maxLines <= 0 {
+		maxLines = 100
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	conn, err := c.connect(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	streamID := c.nextMessageID()
+	deadline := time.Now().Add(timeout)
+	_ = conn.SetReadDeadline(deadline)
+	_ = conn.SetWriteDeadline(deadline)
+	if err := conn.WriteJSON(wsRequest{
+		Command:   "devices/logs",
+		MessageID: streamID,
+		Args: map[string]any{
+			"configuration": configuration,
+			"port":          port,
+		},
+	}); err != nil {
+		return "", fmt.Errorf("send devices/logs: %w", err)
+	}
+
+	var sb strings.Builder
+	lines := 0
+	for lines < maxLines {
+		var resp wsResponse
+		if err := conn.ReadJSON(&resp); err != nil {
+			break
+		}
+		if resp.MessageID != strconv.Itoa(streamID) {
+			continue
+		}
+		if resp.ErrorCode != "" {
+			return stripANSI(sb.String()), fmt.Errorf("%s: %s", resp.ErrorCode, resp.Details)
+		}
+		switch resp.Event {
+		case "output":
+			var line string
+			if err := json.Unmarshal(resp.Data, &line); err == nil {
+				sb.WriteString(line)
+				lines++
+			}
+		case "result":
+			_ = c.stopStream(conn, streamID)
+			return stripANSI(sb.String()), nil
+		}
+	}
+	_ = c.stopStream(conn, streamID)
+	return stripANSI(sb.String()), nil
+}
+
+func (c *Client) stopStream(conn *websocket.Conn, streamID int) error {
+	id := c.nextMessageID()
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if err := conn.WriteJSON(wsRequest{
+		Command:   "devices/stop_stream",
+		MessageID: id,
+		Args:      map[string]any{"stream_id": streamID},
+	}); err != nil {
 		return err
 	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
+	for {
+		var resp wsResponse
+		if err := conn.ReadJSON(&resp); err != nil {
+			return nil
+		}
+		if resp.MessageID == strconv.Itoa(id) {
+			return nil
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("save config: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+}
+
+// GetEncryptionKey extracts api.encryption.key from the raw YAML returned by
+// Device Builder. Secret references cannot be resolved without server-side
+// show-secrets support, so callers should pass psk explicitly if the key uses
+// !secret.
+func (c *Client) GetEncryptionKey(ctx context.Context, configuration string) (string, error) {
+	configuration = ensureYAMLExt(configuration)
+	if raw, err := c.send(ctx, "devices/get_api_key", map[string]any{"configuration": configuration}, 30*time.Second); err == nil {
+		var result struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(raw, &result); err == nil && result.Key != "" {
+			return result.Key, nil
+		}
+		var key string
+		if err := json.Unmarshal(raw, &key); err == nil && key != "" {
+			return key, nil
+		}
+	}
+	content, err := c.GetConfig(ctx, configuration)
+	if err != nil {
+		return "", err
+	}
+	var root yaml.Node
+	if err := yaml.NewDecoder(bytes.NewBufferString(content)).Decode(&root); err != nil && err != io.EOF {
+		return "", fmt.Errorf("parse yaml config: %w", err)
+	}
+	key := findYAMLPath(&root, "api", "encryption", "key")
+	if key == nil {
+		return "", nil
+	}
+	if key.Tag != "" && key.Tag != "!!str" {
+		return "", fmt.Errorf("api.encryption.key uses %s; provide psk explicitly because Device Builder get_config does not resolve secrets", key.Tag)
+	}
+	if strings.HasPrefix(strings.TrimSpace(key.Value), "!secret") {
+		return "", fmt.Errorf("api.encryption.key uses !secret; provide psk explicitly because Device Builder get_config does not resolve secrets")
+	}
+	return key.Value, nil
+}
+
+func findYAMLPath(node *yaml.Node, path ...string) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return findYAMLPath(node.Content[0], path...)
+	}
+	if len(path) == 0 {
+		return node
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == path[0] {
+			return findYAMLPath(node.Content[i+1], path[1:]...)
+		}
 	}
 	return nil
 }
 
-// GetInfo returns the device storage JSON (build info, loaded integrations, etc.).
-func (c *Client) GetInfo(ctx context.Context, configuration string) (json.RawMessage, error) {
-	configuration = ensureYAMLExt(configuration)
-	req, err := c.newRequest(ctx, http.MethodGet, "/info?configuration="+url.QueryEscape(configuration), nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("configuration %q not found", configuration)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("get info: %s", resp.Status)
-	}
-	return io.ReadAll(resp.Body)
-}
-
-// GetJSONConfig returns the fully parsed YAML configuration as JSON, with
-// secrets resolved (runs `esphome config --show-secrets` on the server side).
-// This is the endpoint to use for extracting the API encryption key
-// (api.encryption.key) needed by the native API client.
-func (c *Client) GetJSONConfig(ctx context.Context, configuration string) (json.RawMessage, error) {
-	configuration = ensureYAMLExt(configuration)
-	req, err := c.newRequest(ctx, http.MethodGet, "/json-config?configuration="+url.QueryEscape(configuration), nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("configuration %q not found", configuration)
-	}
-	if resp.StatusCode == http.StatusUnprocessableEntity {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("config validation failed: %s", strings.TrimSpace(string(body)))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("get json-config: %s", resp.Status)
-	}
-	return io.ReadAll(resp.Body)
-}
-
-// GetEncryptionKey extracts the API encryption PSK (base64) from a device's
-// parsed configuration. It calls /json-config and navigates to
-// api.encryption.key. Returns ("", nil) if the device has no encryption
-// configured.
-func (c *Client) GetEncryptionKey(ctx context.Context, configuration string) (string, error) {
-	raw, err := c.GetJSONConfig(ctx, configuration)
-	if err != nil {
-		return "", err
-	}
-	var cfg struct {
-		API struct {
-			Encryption struct {
-				Key string `json:"key"`
-			} `json:"encryption"`
-		} `json:"api"`
-	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return "", fmt.Errorf("parse json-config: %w", err)
-	}
-	return cfg.API.Encryption.Key, nil
+func stripANSI(text string) string {
+	return ansiPattern.ReplaceAllString(text, "")
 }
 
 // ensureYAMLExt makes sure a configuration name ends with .yaml or .yml.
-// ESPHome dashboard endpoints require a full filename.
 func ensureYAMLExt(name string) string {
 	if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
 		return name

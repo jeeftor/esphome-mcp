@@ -169,6 +169,19 @@ func registerTools(s *server.MCPServer, dash *dashboard.Client) {
 	// --- Observability ---
 	s.AddTool(esphomeGetLogsTool(), env.handleGetLogs)
 	s.AddTool(esphomeListEntitiesTool(), env.handleListEntities)
+
+	// --- Compatibility aliases matching loryanstrant/ESPHome-MCP ---
+	s.AddTool(aliasListDevicesTool(), env.handleListDevices)
+	s.AddTool(aliasListDeviceNamesTool(), env.handleListDeviceNames)
+	s.AddTool(aliasCheckDeviceUpdateTool(), env.handleCheckDeviceUpdate)
+	s.AddTool(aliasGetDeviceStatusTool(), env.handleGetDeviceStatus)
+	s.AddTool(aliasGetDeviceVersionTool(), env.handleGetDeviceVersion)
+	s.AddTool(aliasGetDeviceConfigTool(), env.handleGetConfig)
+	s.AddTool(aliasEditDeviceConfigTool(), env.handleEditDeviceConfiguration)
+	s.AddTool(aliasValidateDeviceConfigTool(), env.handleValidate)
+	s.AddTool(aliasGetDeviceLogsTool(), env.handleGetLogs)
+	s.AddTool(aliasInstallDeviceConfigTool(), env.handleInstall)
+	s.AddTool(aliasUpdateDeviceTool(), env.handleInstall)
 }
 
 // ---------- Tool definitions ----------
@@ -230,7 +243,81 @@ func esphomeListEntitiesTool() mcp.Tool {
 		mcp.WithString("device", mcp.Description("Device name or configuration filename. If provided, host and PSK are auto-discovered from the dashboard.")),
 		mcp.WithString("host", mcp.Description("Device hostname or IP address. Required if 'device' is not provided or auto-discovery fails.")),
 		mcp.WithNumber("port", mcp.Description("Native API port (default 6053).")),
-		mcp.WithString("psk", mcp.Description("Base64-encoded API encryption key (api.encryption.key). Falls back to the ESPHOME_PSK env var / config, or auto-discovery from the dashboard via /json-config.")),
+		mcp.WithString("psk", mcp.Description("Base64-encoded API encryption key (api.encryption.key). Falls back to the ESPHOME_PSK env var / config, or auto-discovery from the dashboard via Device Builder.")),
+	)
+}
+
+func aliasListDevicesTool() mcp.Tool {
+	return mcp.NewTool("list_devices", mcp.WithDescription("List all ESPHome devices configured in the dashboard."))
+}
+
+func aliasListDeviceNamesTool() mcp.Tool {
+	return mcp.NewTool("list_device_names", mcp.WithDescription("List ESPHome device names, one per line."))
+}
+
+func aliasCheckDeviceUpdateTool() mcp.Tool {
+	return mcp.NewTool("check_device_update",
+		mcp.WithDescription("Check whether an ESPHome device has a firmware update available."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name.")),
+	)
+}
+
+func aliasGetDeviceStatusTool() mcp.Tool {
+	return mcp.NewTool("get_device_status",
+		mcp.WithDescription("Check whether an ESPHome device is online or offline."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name.")),
+	)
+}
+
+func aliasGetDeviceVersionTool() mcp.Tool {
+	return mcp.NewTool("get_device_version",
+		mcp.WithDescription("Get the deployed and current ESPHome firmware versions for a device."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name.")),
+	)
+}
+
+func aliasGetDeviceConfigTool() mcp.Tool {
+	return mcp.NewTool("get_device_configuration",
+		mcp.WithDescription("Get the raw YAML configuration for an ESPHome device."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name or configuration filename.")),
+	)
+}
+
+func aliasEditDeviceConfigTool() mcp.Tool {
+	return mcp.NewTool("edit_device_configuration",
+		mcp.WithDescription("Save a new YAML configuration for an ESPHome device, then validate it."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name or configuration filename.")),
+		mcp.WithString("yaml_content", mcp.Required(), mcp.Description("Full YAML configuration content to write.")),
+	)
+}
+
+func aliasValidateDeviceConfigTool() mcp.Tool {
+	return mcp.NewTool("validate_device_configuration",
+		mcp.WithDescription("Validate a device's saved ESPHome configuration."),
+		mcp.WithString("device_name", mcp.Description("Device name or configuration filename.")),
+		mcp.WithString("device_or_path", mcp.Description("Device name or configuration filename.")),
+	)
+}
+
+func aliasGetDeviceLogsTool() mcp.Tool {
+	return mcp.NewTool("get_device_logs",
+		mcp.WithDescription("Fetch recent logs from an ESPHome device."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name or configuration filename.")),
+		mcp.WithNumber("lines", mcp.Description("Maximum number of log lines to collect (default 100).")),
+	)
+}
+
+func aliasInstallDeviceConfigTool() mcp.Tool {
+	return mcp.NewTool("install_device_configuration",
+		mcp.WithDescription("Compile and OTA-install firmware to an ESPHome device."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name or configuration filename.")),
+	)
+}
+
+func aliasUpdateDeviceTool() mcp.Tool {
+	return mcp.NewTool("update_device",
+		mcp.WithDescription("Compile and OTA-install the current configuration for an ESPHome device."),
+		mcp.WithString("device_name", mcp.Required(), mcp.Description("Device name or configuration filename.")),
 	)
 }
 
@@ -282,7 +369,7 @@ func (e *toolEnv) handleListDevices(ctx context.Context, _ mcp.CallToolRequest) 
 }
 
 func (e *toolEnv) handleGetConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	device, err := req.RequireString("device")
+	device, err := requireDevice(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -294,11 +381,17 @@ func (e *toolEnv) handleGetConfig(ctx context.Context, req mcp.CallToolRequest) 
 }
 
 func (e *toolEnv) handleSaveConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	device, err := req.RequireString("device")
+	device, err := requireDevice(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	yaml, err := req.RequireString("yaml")
+	yaml := req.GetString("yaml", "")
+	if yaml == "" {
+		yaml = req.GetString("yaml_content", "")
+	}
+	if yaml == "" {
+		err = fmt.Errorf("missing required string: yaml")
+	}
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -309,7 +402,7 @@ func (e *toolEnv) handleSaveConfig(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (e *toolEnv) handleValidate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	device, err := req.RequireString("device")
+	device, err := requireDevice(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -321,7 +414,7 @@ func (e *toolEnv) handleValidate(ctx context.Context, req mcp.CallToolRequest) (
 }
 
 func (e *toolEnv) handleCompile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	device, err := req.RequireString("device")
+	device, err := requireDevice(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -333,7 +426,7 @@ func (e *toolEnv) handleCompile(ctx context.Context, req mcp.CallToolRequest) (*
 }
 
 func (e *toolEnv) handleInstall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	device, err := req.RequireString("device")
+	device, err := requireDevice(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -346,7 +439,7 @@ func (e *toolEnv) handleInstall(ctx context.Context, req mcp.CallToolRequest) (*
 }
 
 func (e *toolEnv) handleGetLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	device, err := req.RequireString("device")
+	device, err := requireDevice(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -359,6 +452,86 @@ func (e *toolEnv) handleGetLogs(ctx context.Context, req mcp.CallToolRequest) (*
 		out = "(no log output received)"
 	}
 	return mcp.NewToolResultText(out), nil
+}
+
+func (e *toolEnv) handleListDeviceNames(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	devices, err := e.dash.ListDevices(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	names := make([]string, 0, len(devices.Configured))
+	for _, d := range devices.Configured {
+		names = append(names, d.Name)
+	}
+	if len(names) == 0 {
+		return mcp.NewToolResultText("No devices found in the ESPHome dashboard."), nil
+	}
+	return mcp.NewToolResultText(strings.Join(names, "\n")), nil
+}
+
+func (e *toolEnv) handleCheckDeviceUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	device, err := e.resolveDevice(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	name := displayDeviceName(device)
+	if device.DeployedVersion == nil || *device.DeployedVersion == "" {
+		return mcp.NewToolResultText(fmt.Sprintf("%s: No deployed version found.", name)), nil
+	}
+	if device.CurrentVersion == nil || *device.CurrentVersion == "" {
+		return mcp.NewToolResultText(fmt.Sprintf("%s: Running version %s. Unable to determine if an update is available.", name, *device.DeployedVersion)), nil
+	}
+	if *device.DeployedVersion != *device.CurrentVersion {
+		return mcp.NewToolResultText(fmt.Sprintf("%s: Update available! Running %s, latest is %s.", name, *device.DeployedVersion, *device.CurrentVersion)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("%s: Up to date at version %s.", name, *device.DeployedVersion)), nil
+}
+
+func (e *toolEnv) handleGetDeviceStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	device, err := e.resolveDevice(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	status := device.State
+	if status == "" {
+		status = device.Status
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	addr := "n/a"
+	if device.Address != nil && *device.Address != "" {
+		addr = *device.Address
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("%s: %s (address: %s)", displayDeviceName(device), status, addr)), nil
+}
+
+func (e *toolEnv) handleGetDeviceVersion(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	device, err := e.resolveDevice(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	deployed := "not yet flashed"
+	if device.DeployedVersion != nil && *device.DeployedVersion != "" {
+		deployed = *device.DeployedVersion
+	}
+	current := "unknown"
+	if device.CurrentVersion != nil && *device.CurrentVersion != "" {
+		current = *device.CurrentVersion
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("%s:\n  Deployed version: %s\n  Current version: %s", displayDeviceName(device), deployed, current)), nil
+}
+
+func (e *toolEnv) handleEditDeviceConfiguration(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	saveResult, _ := e.handleSaveConfig(ctx, req)
+	if saveResult.IsError {
+		return saveResult, nil
+	}
+	validateResult, _ := e.handleValidate(ctx, req)
+	if validateResult.IsError {
+		return mcp.NewToolResultText(saveResult.Content[0].(mcp.TextContent).Text + "\n\nWarning: validation failed: " + validateResult.Content[0].(mcp.TextContent).Text), nil
+	}
+	return mcp.NewToolResultText(saveResult.Content[0].(mcp.TextContent).Text + "\n\n" + validateResult.Content[0].(mcp.TextContent).Text), nil
 }
 
 func (e *toolEnv) handleListEntities(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -430,8 +603,8 @@ func (e *toolEnv) handleListEntities(ctx context.Context, req mcp.CallToolReques
 	return mcp.NewToolResultText(string(out)), nil
 }
 
-// lookupDeviceAddress finds a device's IP address from the dashboard /devices
-// response by matching the device name or configuration filename.
+// lookupDeviceAddress finds a device's IP address from Device Builder by
+// matching the device name or configuration filename.
 func (e *toolEnv) lookupDeviceAddress(ctx context.Context, device string) (string, error) {
 	devices, err := e.dash.ListDevices(ctx)
 	if err != nil {
@@ -450,6 +623,44 @@ func (e *toolEnv) lookupDeviceAddress(ctx context.Context, device string) (strin
 		}
 	}
 	return "", fmt.Errorf("device %q not found in dashboard", device)
+}
+
+func (e *toolEnv) resolveDevice(ctx context.Context, req mcp.CallToolRequest) (dashboard.ConfiguredDevice, error) {
+	name, err := requireDevice(req)
+	if err != nil {
+		return dashboard.ConfiguredDevice{}, err
+	}
+	devices, err := e.dash.ListDevices(ctx)
+	if err != nil {
+		return dashboard.ConfiguredDevice{}, err
+	}
+	target := strings.TrimSuffix(strings.TrimSuffix(strings.ToLower(name), ".yaml"), ".yml")
+	for _, d := range devices.Configured {
+		cfg := strings.TrimSuffix(strings.TrimSuffix(strings.ToLower(d.Configuration), ".yaml"), ".yml")
+		if strings.EqualFold(d.Name, name) || strings.EqualFold(d.FriendlyName, name) || cfg == target {
+			return d, nil
+		}
+	}
+	return dashboard.ConfiguredDevice{}, fmt.Errorf("device %q not found in dashboard", name)
+}
+
+func requireDevice(req mcp.CallToolRequest) (string, error) {
+	for _, key := range []string{"device", "device_name", "device_or_path"} {
+		if value := req.GetString(key, ""); value != "" {
+			return value, nil
+		}
+	}
+	return "", fmt.Errorf("missing required string: device")
+}
+
+func displayDeviceName(device dashboard.ConfiguredDevice) string {
+	if device.FriendlyName != "" {
+		return device.FriendlyName
+	}
+	if device.Name != "" {
+		return device.Name
+	}
+	return device.Configuration
 }
 
 // summarize trims long command output to errors + the last N lines, prefixed

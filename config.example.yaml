@@ -3,12 +3,14 @@
 # Any value below can also be set via environment variables prefixed with
 # ESPHOME_ (e.g. ESPHOME_URL, ESPHOME_PASSWORD, ESPHOME_PSK).
 
-# ESPHome dashboard URL (the web UI on port 6052).
+# ESPHome dashboard / Device Builder URL (the web UI on port 6052).
 url: http://homeassistant.local:6052
 
 # --- Auth (choose one mode) ---
 
-# Mode 1: Standalone ESPHome with password (Basic auth).
+# Mode 1: Standalone ESPHome with password.
+# Sent during the WebSocket handshake and via Device Builder auth/login when
+# the server reports requires_auth.
 # Set username only if your dashboard requires it; most use password-only.
 username: ""
 password: ""
@@ -26,15 +28,14 @@ password: ""
 #
 # 2b. Ingress bypass (port 6052 mapped, auth still enabled):
 #   ha_addon: true   # or ESPHOME_HA_ADDON=true
-# Sends X-HA-Ingress: YES on all requests, which the addon treats as
+# Sends X-HA-Ingress: YES on dashboard requests, which the addon treats as
 # authenticated (the same way HA's ingress proxy does).
 ha_addon: false
 
 # --- Native API (entity states) ---
 
 # Default API encryption PSK (base64) used by esphome_list_entities when the
-# tool call does not supply one. This is the `api.encryption.key` value from
-# the device's YAML.
+# tool call does not supply one and Device Builder cannot expose it.
 psk: ""
 
 # Optional: verify the device's reported name matches this during native API

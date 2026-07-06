@@ -6,9 +6,9 @@ firmware OTA, pull logs, and read live entity states.
 
 It talks to two ESPHome transports:
 
-1. **ESPHome Dashboard HTTP/WebSocket API** (port 6052) — config CRUD,
-   compile, install, logs. Works against the dashboard run by `esphome
-   dashboard` or the Home Assistant ESPHome addon.
+1. **ESPHome Device Builder WebSocket API** (port 6052, `/ws`) — config CRUD,
+   validate, compile, install, and logs. This targets the modern ESPHome
+   2026.6+ dashboard protocol used by ESPHome 2026.7.
 2. **ESPHome Native TCP API** (port 6053, Noise-encrypted) — live entity
    states via `esphome_list_entities`.
 
@@ -25,10 +25,16 @@ It talks to two ESPHome transports:
 | `esphome_get_logs`       | Dashboard  | Fetch the last N log lines                            |
 | `esphome_list_entities`  | Native API | List entities + current states (auto-discovers PSK)  |
 
+The server also registers compatibility aliases matching
+`loryanstrant/ESPHome-MCP`, including `list_devices`, `list_device_names`,
+`get_device_configuration`, `edit_device_configuration`,
+`validate_device_configuration`, `install_device_configuration`, `update_device`,
+and related status/version/log tools.
+
 `esphome_list_entities` can auto-discover the device's host and encryption PSK
 from the dashboard — just pass `device` instead of `host`/`psk`. The host is
-fetched from `/devices` and the PSK from `/json-config` (which resolves
-`!secret` references).
+fetched from `devices/list` and the PSK is fetched from the Device Builder API
+when available, with YAML parsing as a fallback.
 
 ## Install
 
@@ -94,17 +100,16 @@ Config is read from `~/.config/esphome-mcp/config.yaml` (see
 | `ESPHOME_PSK`       | `psk`          | `""` (native API encryption)  |
 
 `esphome_list_entities` can auto-discover the device's host and encryption PSK
-from the dashboard — just pass `device` instead of `host`/`psk`. The PSK is
-fetched from `/json-config` (which resolves `!secret` references). You can
-also set `ESPHOME_PSK` as a fallback or provide `psk` per call.
+from the dashboard — just pass `device` instead of `host`/`psk`. You can also
+set `ESPHOME_PSK` as a fallback or provide `psk` per call.
 
 ## Auth modes
 
 ### Standalone ESPHome (password)
 
 Set `ESPHOME_PASSWORD` (and `ESPHOME_USERNAME` if your dashboard requires it).
-Basic auth is sent on all HTTP and WebSocket requests. XSRF tokens are handled
-automatically for POST requests (e.g. `esphome_save_config`).
+The client sends Basic auth during the WebSocket handshake and also performs
+Device Builder `auth/login` when the server reports `requires_auth`.
 
 ### Home Assistant ESPHome addon
 
@@ -160,9 +165,9 @@ Map port 6052 in the addon config and set `ESPHOME_HA_ADDON=true`. This sends
 }
 ```
 
-Note: with auto-discovery, you no longer need to set `ESPHOME_PSK` —
-`esphome_list_entities` will fetch it from the dashboard via `/json-config`
-when you pass the `device` parameter.
+Note: with auto-discovery, you usually do not need to set `ESPHOME_PSK`;
+`esphome_list_entities` asks Device Builder for the API key when you pass the
+`device` parameter. If your dashboard cannot expose the key, pass `psk`.
 
 ### HTTP (Docker / remote)
 
@@ -244,6 +249,9 @@ make help      # list all targets
 - Dashboard auth supports: Basic auth (standalone ESPHome with password), HA
   addon ingress bypass (`X-HA-Ingress` header), or no auth (addon with
   `DISABLE_HA_AUTHENTICATION`). See [Auth modes](#auth-modes) above.
+- Dashboard operations use the modern Device Builder `/ws` command bus
+  (`devices/list`, `devices/get_config`, `editor/validate_yaml`,
+  `firmware/compile`, `firmware/install`, and `devices/logs`).
 - `esphome_compile` / `esphome_install` return a summarized build log (errors
   + last N lines) to keep token usage low.
 - The HTTP serve mode uses the MCP Streamable HTTP transport, which supports
